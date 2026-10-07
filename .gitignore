@@ -1,0 +1,51 @@
+# Built application files
+*.apk
+*.aar
+*.ap_
+*.aab
+
+# Files for the ART/Dalvik VM
+*.dex
+
+# Java class files
+*.class
+
+# Generated files
+bin/
+gen/
+out/
+#  Gradle files
+.gradle/
+build/
+**/build
+
+# Local configuration file (sdk path, etc)
+local.properties
+
+# Log/OS Files
+*.log
+.DS_Store
+Thumbs.db
+
+# Android Studio / IntelliJ
+*.iml
+.idea/
+/*.idea
+/captures
+.externalNativeBuild
+.cxx
+
+# Keystore / signing artifacts —— 绝不能提交
+*.keystore
+*.jks
+*.p12
+*.pfx
+
+# 构建 / 发布产物（非源码，AGP 生成）
+app/release/
+
+# WorkBuddy 工作记忆目录（含项目备忘，不应公开）
+.workbuddy-ai/
+
+# Node / tooling caches (if any)
+node_modules/
