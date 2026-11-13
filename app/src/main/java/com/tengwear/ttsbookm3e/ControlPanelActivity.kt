@@ -594,8 +594,10 @@ class ControlPanelActivity : AppCompatActivity() {
             },
             text = {
                 Text(
-                    text = "字号 $fontInt · 每页 $rowsInt 行 · 每行 $baseInt" +
-                            if (trimInt > 0) "（首尾 −$trimInt）" else "",
+                    // 分页已改为按真实字宽测量；这几个滑块现在分别控制
+                    // 每页行数上限、正文行宽（水平安全边距）、上下留白。
+                    text = "字号 $fontInt · 每页最多 $rowsInt 行 · 行宽 $baseInt" +
+                            if (trimInt > 0) " · 留白 $trimInt" else "",
                     style = MaterialTheme.typography.labelMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     textAlign = TextAlign.Center,
@@ -623,7 +625,7 @@ class ControlPanelActivity : AppCompatActivity() {
                 }
                 item {
                     SettingSlider(
-                        label = "每行字数",
+                        label = "行宽",
                         value = baseChars,
                         valueRange = 4f..20f,
                         steps = 15,
@@ -632,7 +634,7 @@ class ControlPanelActivity : AppCompatActivity() {
                 }
                 item {
                     SettingSlider(
-                        label = "首尾缩字",
+                        label = "首尾留白",
                         value = edgeTrim,
                         valueRange = 0f..4f,
                         steps = 3,

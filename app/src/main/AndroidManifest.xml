@@ -5,6 +5,14 @@
 
     <uses-feature android:name="android.hardware.type.watch" />
 
+    <!-- Android 11+ 包可见性：枚举 / 绑定第三方 TTS 引擎需要显式声明，
+         否则 getEngines() 只返回默认引擎，指定引擎初始化会失败。 -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.TTS_SERVICE" />
+        </intent>
+    </queries>
+
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"
         android:maxSdkVersion="28" />

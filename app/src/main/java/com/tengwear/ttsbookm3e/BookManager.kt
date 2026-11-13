@@ -2,6 +2,7 @@ package com.tengwear.ttsbookm3e
 
 import android.content.Context
 import android.content.SharedPreferences
+import android.util.Log
 import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
 import java.io.File
@@ -31,45 +32,58 @@ object BookManager {
         }
     }
 
-    private fun ensureInitialized() {
+    /**
+     * 惰性兜底初始化。以前这里直接抛 UninitializedPropertyAccessException，
+     * 只要系统直接恢复某个非主 Activity（手表上很常见）就会闪退。
+     * 现在任何入口都能安全拿到同一个 SharedPreferences。
+     */
+    private fun storage(): SharedPreferences {
         if (!::prefs.isInitialized) {
-            throw UninitializedPropertyAccessException("BookManager has not been initialized. Call BookManager.init(context) first.")
+            prefs = TtsBookApplication.instance.applicationContext
+                .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            initialized = true
         }
+        return prefs
     }
 
     fun getAllBooks(): List<Book> {
-        ensureInitialized()
-        val json = prefs.getString(KEY_BOOKS, "[]")
-        val type = object : TypeToken<List<Book>>() {}.type
-        return gson.fromJson(json, type) ?: emptyList()
+        // 书架 JSON 可能因旧版本格式 / 写入中断而损坏，解析失败时退回空书架，
+        // 不能让 Gson 的 JsonSyntaxException 把应用带崩。
+        return try {
+            val json = storage().getString(KEY_BOOKS, "[]")
+            val type = object : TypeToken<List<Book>>() {}.type
+            gson.fromJson<List<Book>>(json, type) ?: emptyList()
+        } catch (e: Exception) {
+            Log.e("BookManager", "书架数据解析失败，返回空书架", e)
+            emptyList()
+        }
     }
 
     fun saveBooks(books: List<Book>) {
-        ensureInitialized()
-        val json = gson.toJson(books)
-        prefs.edit().putString(KEY_BOOKS, json).apply()
+        try {
+            val json = gson.toJson(books)
+            storage().edit().putString(KEY_BOOKS, json).apply()
+        } catch (e: Exception) {
+            Log.e("BookManager", "保存书架失败", e)
+        }
     }
 
     fun addBook(book: Book) {
-        ensureInitialized()
         val list = getAllBooks().toMutableList()
         list.add(book)
         saveBooks(list)
     }
 
     fun deleteBook(path: String) {
-        ensureInitialized()
         val list = getAllBooks().filter { it.path != path }
         saveBooks(list)
     }
 
     fun getBookByPath(path: String): Book? {
-        ensureInitialized()
         return getAllBooks().firstOrNull { it.path == path }
     }
 
     fun updateBook(book: Book) {
-        ensureInitialized()
         val list = getAllBooks().toMutableList()
         val index = list.indexOfFirst { it.path == book.path }
         if (index >= 0) {
@@ -90,17 +104,24 @@ object BookManager {
         val chapters = mutableListOf<Chapter>()
         if (content.isEmpty()) return chapters
 
-        val patternStr = if (keywords.isNotEmpty()) {
-            when (keywords.size) {
-                1 -> """^${keywords[0]}.*$""".toRegex(RegexOption.MULTILINE)
-                2 -> """${keywords[0]}.*${keywords[1]}""".toRegex(RegexOption.MULTILINE)
-                else -> keywords.joinToString("|") { """^$it.*$""" }.toRegex(RegexOption.MULTILINE)
+        // ★ 自定义章节关键词必须先转义：用户若输入了 "(" "[" "*" 等正则元字符，
+        // 直接拼进 Regex 会抛 PatternSyntaxException，导入书籍时直接闪退。
+        val pattern = try {
+            if (keywords.isNotEmpty()) {
+                when (keywords.size) {
+                    1 -> """^${Regex.escape(keywords[0])}.*$""".toRegex(RegexOption.MULTILINE)
+                    2 -> """${Regex.escape(keywords[0])}.*${Regex.escape(keywords[1])}"""
+                        .toRegex(RegexOption.MULTILINE)
+                    else -> keywords.joinToString("|") { """^${Regex.escape(it)}.*$""" }
+                        .toRegex(RegexOption.MULTILINE)
+                }
+            } else {
+                buildDefaultChapterRegex()
             }
-        } else {
+        } catch (e: Exception) {
+            Log.e("BookManager", "自定义章节规则非法，回退默认规则", e)
             buildDefaultChapterRegex()
         }
-
-        val pattern = patternStr
         var lastMatchEnd = 0
         var matchResult = pattern.find(content)
         var lastTitle = "开始"

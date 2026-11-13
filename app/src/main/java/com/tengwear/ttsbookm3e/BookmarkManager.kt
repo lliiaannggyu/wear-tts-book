@@ -2,6 +2,7 @@ package com.tengwear.ttsbookm3e
 
 import android.content.Context
 import android.content.SharedPreferences
+import android.util.Log
 import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
 
@@ -20,8 +21,14 @@ class BookmarkManager(private val context: Context, private val bookPath: String
     private val type = object : TypeToken<List<Bookmark>>() {}.type
 
     fun getBookmarks(): List<Bookmark> {
-        val json = prefs.getString(key, "[]")
-        return gson.fromJson(json, type) ?: emptyList()
+        // 损坏的 JSON 不应让书签页闪退
+        return try {
+            val json = prefs.getString(key, "[]")
+            gson.fromJson<List<Bookmark>>(json, type) ?: emptyList()
+        } catch (e: Exception) {
+            Log.e("BookmarkManager", "书签数据解析失败", e)
+            emptyList()
+        }
     }
 
     fun addBookmark(bookmark: Bookmark) {

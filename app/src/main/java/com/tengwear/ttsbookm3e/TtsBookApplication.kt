@@ -33,6 +33,12 @@ class TtsBookApplication : Application() {
     override fun onCreate() {
         super.onCreate()
         instance = this
+        // ★ 在 Application 里统一初始化 BookManager。
+        // 手表上进程常被回收，系统可能直接恢复 ChapterListActivity /
+        // ControlPanelActivity / BookmarkListActivity 等非主 Activity；
+        // 若只在 MainActivity 里 init，这些页面一读书架就抛
+        // UninitializedPropertyAccessException 直接闪退。
+        BookManager.init(this)
         // 进程启动即载入用户种子色：所有页面首帧即为正确配色，切换主题后全局实时生效
         com.tengwear.ttsbookm3e.ui.theme.SeedColorState.ensureLoaded(this)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {

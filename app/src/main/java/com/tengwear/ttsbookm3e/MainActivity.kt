@@ -19,6 +19,7 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.ParcelFileDescriptor
+import android.util.Log
 import android.widget.Toast
 import androidx.activity.compose.setContent
 import androidx.appcompat.app.AppCompatActivity
@@ -66,11 +67,17 @@ import androidx.compose.ui.input.rotary.onRotaryScrollEvent
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import com.tengwear.ttsbookm3e.reader.PagedChapter
+import com.tengwear.ttsbookm3e.reader.TextPager
 import androidx.wear.compose.material3.AlertDialog
 import androidx.wear.compose.material3.AppScaffold
 import androidx.wear.compose.material3.Button
@@ -100,17 +107,32 @@ class MainActivity : AppCompatActivity(), TtsBookApplication.CountdownListener {
     private var isPdfMode by mutableStateOf(false)
 
     // ==================== 文本模式状态 ====================
+    // 说明：原实现按「每页固定 N 个字符 + 圆屏梯形字数表」硬切正文，
+    // 已替换为移植自 wearos-novel-reader 的测量式分页（TextPager + Pagination）。
     private var currentChapterIndex by mutableIntStateOf(0)
     private var currentChapterText by mutableStateOf("")
     private var currentOffsetInChapter by mutableIntStateOf(0)
-    private var rowsPerPage by mutableIntStateOf(6)
-    private var charsSequence by mutableStateOf(listOf(8, 10, 10, 10, 10, 8))
     private var currentPage by mutableIntStateOf(0)
     private var totalPages by mutableIntStateOf(1)
     private var fontSize by mutableStateOf(18f)
-    private var lineStartOffsets = mutableListOf<Int>()
-    private var lineEndOffsets = mutableListOf<Int>()
-    private var isAutoPageTurning = false
+
+    /** 一章的排版结果；页码 ↔ 章节内字符偏移的互转全部由它负责。 */
+    private var pagedChapter by mutableStateOf(PagedChapter.empty())
+
+    // 控制面板的旧设置重新映射到新引擎：
+    //   每页行数   → maxLinesPerPage（按高度切页后再细分）
+    //   每行字数   → 水平安全边距（字数越大边距越小）
+    //   首尾缩字   → 垂直安全边距（首尾留白越多，圆屏上下越安全）
+    private var maxLinesPerPage by mutableIntStateOf(6)
+    private var horizontalPaddingDp by mutableFloatStateOf(20f)
+    private var verticalPaddingDp by mutableFloatStateOf(24f)
+
+    /** 章末时 onRangeStart 与 onDone 可能同时到达，用此标志避免重复翻章。 */
+    private var isChapterSwitching = false
+
+    /** 应用窗口尺寸（px），供非 Composable 的分页计算使用。 */
+    private var screenWidthPx = 0
+    private var screenHeightPx = 0
 
     // ==================== PDF 模式状态 ====================
     private var pdfRenderer: PdfRenderer? = null
@@ -221,26 +243,19 @@ class MainActivity : AppCompatActivity(), TtsBookApplication.CountdownListener {
             readerService = binder.getService()
             bound = true
             readerService?.let {
+                // 听书自动翻页：TTS 逐词回调的是「章节内字符偏移」，直接交给
+                // 测量式分页结果换算页码，不必再按固定字数猜页边界。
                 it.onHighlight = { offset ->
                     runOnUiThread {
-                        if (isPdfMode) return@runOnUiThread
-                        currentOffsetInChapter = offset
-                        val cpp = getCharsPerPage()
-                        if (cpp > 0 && currentPage < totalPages - 1) {
-                            val pageEnd = (currentPage + 1) * cpp
-                            if (offset >= pageEnd && !isAutoPageTurning) {
-                                isAutoPageTurning = true
-                                autoNextPage()
-                                handler.postDelayed({ isAutoPageTurning = false }, 200)
-                            }
-                        }
-                        if (offset >= currentChapterText.length && currentChapterText.isNotEmpty()) {
-                            onChapterEnd()
-                        }
-                        highlightCurrentLine(offset)
+                        if (isPdfMode || isChapterSwitching) return@runOnUiThread
+                        currentOffsetInChapter = offset.coerceIn(0, currentChapterText.length)
+                        val target = pagedChapter.pageIndexForOffset(currentOffsetInChapter)
+                        if (target > currentPage) currentPage = target
                         saveCurrentProgress()
                     }
                 }
+                // 一章读完由 onChapterDone 统一触发自动翻章节；
+                // 不再让 onRangeStart 的偏移判断也触发一次，避免章末连跳两章。
                 it.onChapterDone = {
                     runOnUiThread { if (!isPdfMode) onChapterEnd() }
                 }
@@ -262,6 +277,9 @@ class MainActivity : AppCompatActivity(), TtsBookApplication.CountdownListener {
         prefs = getSharedPreferences("ttsbook_prefs", Context.MODE_PRIVATE)
         progressPrefs = getSharedPreferences("ttsbook_progress", Context.MODE_PRIVATE)
         BookManager.init(this)
+        val dm = resources.displayMetrics
+        screenWidthPx = dm.widthPixels
+        screenHeightPx = dm.heightPixels
         loadSettings()
 
         val showPermissionGuide = shouldShowFirstRunDialog()
@@ -289,8 +307,15 @@ class MainActivity : AppCompatActivity(), TtsBookApplication.CountdownListener {
         checkStoragePermission()
         checkNotificationPermission()
 
-        handleIntent(intent)
-        restoreProgressIfNeeded()
+        // 冷启动会直接从持久化进度打开上次阅读的书。若文件损坏 / 被移动 /
+        // 权限变化 / 编码异常，绝不能让异常从 onCreate 抛出导致应用闪退。
+        try {
+            handleIntent(intent)
+            restoreProgressIfNeeded()
+        } catch (e: Exception) {
+            Log.e("MainActivity", "恢复阅读进度失败", e)
+            Toast.makeText(this, "读取书籍失败，请从书架重新导入", Toast.LENGTH_SHORT).show()
+        }
 
         setContent {
             TtsbookTheme {
@@ -494,8 +519,15 @@ class MainActivity : AppCompatActivity(), TtsBookApplication.CountdownListener {
 
     @Composable
     private fun TextReaderScreen() {
-        val pageText = remember(currentPage, currentChapterText, rowsPerPage, charsSequence, fontSize) {
-            buildPageText()
+        // 正文来自测量式分页结果；每页的行是排版时量好的，按 \n 拼接即可精确复现。
+        val pageText = pagedChapter.pageText(currentPage)
+        val highlightLine = pagedChapter.highlightedLine(currentPage, currentOffsetInChapter)
+        // 行高以排版实测像素为准，保证屏幕显示与分页测量完全一致；
+        // 尚未导入书籍时没有排版结果，用字号倍率给提示文字一个正常行高。
+        val lineHeightSp = if (currentChapterText.isEmpty()) {
+            (fontSize * 1.4f).sp
+        } else {
+            (pagedChapter.lineHeightPx / LocalDensity.current.density).sp
         }
         val focusRequester = remember { FocusRequester() }
         LaunchedEffect(Unit) {
@@ -506,6 +538,24 @@ class MainActivity : AppCompatActivity(), TtsBookApplication.CountdownListener {
         //   背景 → background（tone 0），正文 → onSurface（tone 95）
         val backgroundColor = MaterialTheme.colorScheme.background
         val textColor = MaterialTheme.colorScheme.onSurface
+        val highlightBg = MaterialTheme.colorScheme.primaryContainer
+        val highlightFg = MaterialTheme.colorScheme.onPrimaryContainer
+
+        // 朗读行高亮：把 TTS 当前字符所在的那一行染成主题容器色。
+        // 原来的「按固定字数硬切」实现无法做到，因为行边界本来就不准。
+        val annotatedPage = buildAnnotatedString {
+            val lines = pageText.split("\n")
+            lines.forEachIndexed { i, line ->
+                if (i == highlightLine) {
+                    withStyle(SpanStyle(background = highlightBg, color = highlightFg)) {
+                        append(line)
+                    }
+                } else {
+                    append(line)
+                }
+                if (i != lines.lastIndex) append("\n")
+            }
+        }
 
         AppScaffold {
             Box(
@@ -558,19 +608,37 @@ class MainActivity : AppCompatActivity(), TtsBookApplication.CountdownListener {
                         }
                         true
                     }
-                    .padding(horizontal = 20.dp, vertical = 24.dp),
+                    .padding(horizontal = horizontalPaddingDp.dp, vertical = verticalPaddingDp.dp),
                 contentAlignment = Alignment.Center
             ) {
                 Text(
-                    text = pageText,
+                    text = if (currentChapterText.isEmpty()) {
+                        buildAnnotatedString { append("请从书架导入书籍\n点击进入书架") }
+                    } else {
+                        annotatedPage
+                    },
                     style = TextStyle(
                         fontSize = fontSize.sp,
                         color = textColor,
                         textAlign = TextAlign.Center,
-                        lineHeight = (fontSize * 1.4).sp
+                        lineHeight = lineHeightSp
                     ),
+                    // 每行在分页时已按真实字宽量好，禁止二次自动换行，
+                    // 否则会破坏「页码 ↔ 字符偏移」的对应关系。
+                    softWrap = false,
                     modifier = Modifier.fillMaxWidth()
                 )
+
+                if (currentChapterText.isNotEmpty()) {
+                    Text(
+                        text = "${currentPage + 1} / $totalPages",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier
+                            .align(Alignment.BottomCenter)
+                            .padding(bottom = 4.dp)
+                    )
+                }
             }
         }
     }
@@ -1142,48 +1210,37 @@ class MainActivity : AppCompatActivity(), TtsBookApplication.CountdownListener {
 
     // ==================== 文本逻辑 ====================
 
-    private fun buildPageText(): String {
-        if (currentChapterText.isEmpty()) return "请从书架导入书籍\n点击进入书架"
-        var cpp = getCharsPerPage()
-        if (cpp <= 0) cpp = 100
-        var charIndex = currentPage * cpp
-        val endIndex = min(charIndex + cpp, currentChapterText.length)
-        val lines = mutableListOf<String>()
-        val seq = charsSequence
-        lineStartOffsets.clear()
-        lineEndOffsets.clear()
-        if (charIndex >= currentChapterText.length) return "（已读至末尾）"
-        for (i in 0 until rowsPerPage) {
-            if (charIndex >= endIndex) break
-            var charsThisLine = if (i < seq.size) seq[i] else seq.lastOrNull() ?: 10
-            val remaining = endIndex - charIndex
-            if (remaining < charsThisLine) charsThisLine = remaining
-            if (remaining == 1 && i < rowsPerPage - 1 && lines.isNotEmpty()) {
-                val extendChar = currentChapterText.substring(charIndex, charIndex + 1)
-                lineEndOffsets[lineEndOffsets.size - 1] = charIndex + 1
-                lines[lines.size - 1] = lines.last() + extendChar.replace(" ", "\u3000")
-                charIndex++
-                continue
-            }
-            val lineEnd = min(charIndex + charsThisLine, endIndex)
-            var lineText = currentChapterText.substring(charIndex, lineEnd)
-            if (lineText.isNotEmpty()) {
-                lineText = lineText.replace(" ", "\u3000")
-                lines.add(lineText)
-                lineStartOffsets.add(charIndex)
-                lineEndOffsets.add(lineEnd)
-            }
-            charIndex = lineEnd
+    /**
+     * 按「当前章节正文 + 屏幕尺寸 + 阅读设置」重新排版分页。
+     *
+     * 这是替换掉原有「按固定字数硬切」之后的唯一分页入口：章节切换、字号变化、
+     * 进度恢复都走这里。分页结果自带字符偏移表，听书自动翻页 / 自动翻章节
+     * 只需按 TTS 回调的字符偏移查表即可。
+     */
+    private fun repaginate(alignPageToOffset: Boolean = true) {
+        val dm = resources.displayMetrics
+        if (screenWidthPx <= 0 || screenHeightPx <= 0) {
+            screenWidthPx = dm.widthPixels
+            screenHeightPx = dm.heightPixels
         }
-        if (lines.size > 1 && lines.last().length < 2) {
-            val lastLine = lines.removeAt(lines.size - 1)
-            val lastEnd = lineEndOffsets.removeAt(lineEndOffsets.size - 1)
-            if (lines.isNotEmpty()) {
-                lines[lines.size - 1] = lines.last() + lastLine
-                lineEndOffsets[lines.size - 1] = lastEnd
-            }
+        val result = TextPager.paginate(
+            currentChapterText,
+            TextPager.Config(
+                widthPx = screenWidthPx,
+                heightPx = screenHeightPx,
+                textSizePx = fontSize * dm.density,
+                horizontalPaddingPx = horizontalPaddingDp * dm.density,
+                verticalPaddingPx = verticalPaddingDp * dm.density,
+                maxLinesPerPage = maxLinesPerPage
+            )
+        )
+        pagedChapter = result
+        totalPages = result.pageCount
+        currentPage = if (alignPageToOffset) {
+            result.pageIndexForOffset(currentOffsetInChapter)
+        } else {
+            result.clampPage(currentPage)
         }
-        return lines.joinToString("\n")
     }
 
     private fun openControlPanel() {
@@ -1195,9 +1252,10 @@ class MainActivity : AppCompatActivity(), TtsBookApplication.CountdownListener {
             val intent = Intent(this, ControlPanelActivity::class.java)
             intent.putExtra("book_path", currentBook!!.path)
             intent.putExtra("book_name", currentBook!!.name)
-            val chapter = currentBook!!.chapters[currentChapterIndex]
-            intent.putExtra("chapter_name", chapter.title)
-            intent.putExtra("chapter_index", currentChapterIndex)
+            // 章节列表可能因文件变化被重建，索引必须收敛，避免越界闪退
+            val chapter = currentBook!!.chapters.getOrNull(currentChapterIndex)
+            intent.putExtra("chapter_name", chapter?.title ?: "")
+            intent.putExtra("chapter_index", currentChapterIndex.coerceAtLeast(0))
             startActivity(intent)
         }
     }
@@ -1245,27 +1303,18 @@ class MainActivity : AppCompatActivity(), TtsBookApplication.CountdownListener {
         }
     }
 
-    private fun autoNextPage() {
-        if (currentPage < totalPages - 1) {
-            currentPage++
-            saveCurrentProgress()
-        } else {
-            onChapterEnd()
-        }
-    }
-
     private fun manualNextPage() {
         if (isPdfMode) return
         if (currentPage < totalPages - 1) {
             currentPage++
-            val cpp = getCharsPerPage()
-            currentOffsetInChapter = (currentPage * cpp).coerceAtMost(currentChapterText.length)
+            currentOffsetInChapter = pagedChapter.offsetForPage(currentPage)
             readerService?.seekToOffset(currentOffsetInChapter)
             saveCurrentProgress()
         } else {
             val book = currentBook ?: return
             if (currentChapterIndex < book.chapters.size - 1) {
-                switchToChapter(currentChapterIndex + 1, 0)
+                // 手动翻到下一章：是否继续朗读取决于当前播放状态
+                switchToChapter(currentChapterIndex + 1, 0, autoPlay = isPlaying)
             } else {
                 Toast.makeText(this, "已是最后一章", Toast.LENGTH_SHORT).show()
             }
@@ -1276,35 +1325,26 @@ class MainActivity : AppCompatActivity(), TtsBookApplication.CountdownListener {
         if (isPdfMode) return
         if (currentPage > 0) {
             currentPage--
-            val cpp = getCharsPerPage()
-            currentOffsetInChapter = (currentPage * cpp).coerceAtMost(currentChapterText.length)
+            currentOffsetInChapter = pagedChapter.offsetForPage(currentPage)
             readerService?.seekToOffset(currentOffsetInChapter)
             saveCurrentProgress()
         } else {
-            val book = currentBook ?: return
+            if (currentBook == null) return
             if (currentChapterIndex > 0) {
-                val prevChapter = currentChapterIndex - 1
-                val prevBook = BookManager.getBookByPath(book.path) ?: return
-                if (prevChapter >= prevBook.chapters.size) {
-                    Toast.makeText(this, "已是第一章", Toast.LENGTH_SHORT).show()
-                    return
-                }
-                val prevData = prevBook.chapters[prevChapter]
-                val fullText = readBookText(prevBook)
-                val prevText = sliceChapterText(fullText, prevData)
-                val cpp = getCharsPerPage()
-                val total = if (cpp > 0) ceil(prevText.length.toDouble() / cpp).toInt() else 1
-                switchToChapter(prevChapter, (total - 1).coerceAtLeast(0))
+                // Int.MAX_VALUE 表示「跳到上一章最后一页」（与移植来源项目约定一致）
+                switchToChapter(currentChapterIndex - 1, Int.MAX_VALUE, autoPlay = isPlaying)
             } else {
                 Toast.makeText(this, "已是第一章", Toast.LENGTH_SHORT).show()
             }
         }
     }
 
+    /** 一章朗读完毕：自动进入下一章并继续播放（听书自动翻章节）。 */
     private fun onChapterEnd() {
+        if (isChapterSwitching) return
         val book = currentBook ?: return
         if (currentChapterIndex < book.chapters.size - 1) {
-            switchToChapter(currentChapterIndex + 1, 0)
+            switchToChapter(currentChapterIndex + 1, 0, autoPlay = true)
         } else {
             readerService?.pause()
             isPlaying = false
@@ -1312,32 +1352,57 @@ class MainActivity : AppCompatActivity(), TtsBookApplication.CountdownListener {
         }
     }
 
-    private fun switchToChapter(newChapterIndex: Int, targetPage: Int) {
+    /**
+     * 切换章节并对接听书：
+     *  - 重新做测量式分页，按目标页算出章节内字符偏移；
+     *  - 把新章节交给 TTS，并从该偏移继续朗读；
+     *  - autoPlay=true 用于「听书自动翻章节」，手动翻页则遵循当前播放状态。
+     */
+    private fun switchToChapter(newChapterIndex: Int, targetPage: Int, autoPlay: Boolean = true) {
         val book = currentBook ?: return
+        if (isChapterSwitching) return
         if (newChapterIndex < 0 || newChapterIndex >= book.chapters.size) return
-        readerService?.pause()
-        isPlaying = false
-        val chapter = book.chapters[newChapterIndex]
-        val file = File(book.path)
-        if (!file.exists()) {
+        if (!File(book.path).exists()) {
             Toast.makeText(this, "文件丢失", Toast.LENGTH_SHORT).show()
             return
         }
-        val fullText = readBookText(book)
-        currentChapterText = sliceChapterText(fullText, chapter)
-        currentChapterIndex = newChapterIndex
-        currentOffsetInChapter = 0
-        val cpp = getCharsPerPage()
-        totalPages = if (cpp > 0) ceil(currentChapterText.length.toDouble() / cpp).toInt() else 1
-        if (totalPages < 1) totalPages = 1
-        val page = targetPage.coerceIn(0, totalPages - 1)
-        currentPage = page
-        currentOffsetInChapter = (page * cpp).coerceIn(0, currentChapterText.length)
-        readerService?.setChapter(currentChapterText)
-        readerService?.seekToOffset(currentOffsetInChapter)
-        saveCurrentProgress()
-        readerService?.resume()
-        isPlaying = true
+        isChapterSwitching = true
+        try {
+            readerService?.pause()
+            isPlaying = false
+
+            val fullText = try {
+                readBookText(book)
+            } catch (e: Exception) {
+                Log.e("MainActivity", "切章读取失败", e)
+                Toast.makeText(this, "读取章节失败：${e.message}", Toast.LENGTH_SHORT).show()
+                return
+            }
+            val chapter = book.chapters[newChapterIndex]
+            currentChapterText = sliceChapterText(fullText, chapter)
+            currentChapterIndex = newChapterIndex
+            currentOffsetInChapter = 0
+
+            repaginate(alignPageToOffset = false)
+            val page = if (targetPage == Int.MAX_VALUE) {
+                totalPages - 1
+            } else {
+                targetPage.coerceIn(0, totalPages - 1)
+            }
+            currentPage = page
+            currentOffsetInChapter = pagedChapter.offsetForPage(page)
+
+            readerService?.setChapter(currentChapterText)
+            readerService?.seekToOffset(currentOffsetInChapter)
+            saveCurrentProgress()
+
+            if (autoPlay && currentChapterText.isNotEmpty()) {
+                readerService?.resume()
+                isPlaying = true
+            }
+        } finally {
+            isChapterSwitching = false
+        }
     }
 
     /**
@@ -1401,7 +1466,15 @@ class MainActivity : AppCompatActivity(), TtsBookApplication.CountdownListener {
             return
         }
 
-        val fullText = readBookText(book)
+        // 权限变化 / 文件损坏 / 未知编码都可能让 readText 抛异常；
+        // 就地兜住，避免异常穿透到 onCreate 导致冷启动闪退。
+        val fullText = try {
+            readBookText(book)
+        } catch (e: Exception) {
+            Log.e("MainActivity", "读取书籍失败: ${book.path}", e)
+            Toast.makeText(this, "读取书籍失败：${e.message}", Toast.LENGTH_SHORT).show()
+            return
+        }
 
         // 章节偏移量可能来自旧版本的文件（文件被替换 / 编码变化 / 截断），
         // 此时持久化的 offset 会超出当前文件长度，必须先校验再使用，否则 substring 越界闪退。
@@ -1439,16 +1512,8 @@ class MainActivity : AppCompatActivity(), TtsBookApplication.CountdownListener {
         var offset = targetOffset
         if (offset < 0 || offset > currentChapterText.length) offset = 0
         currentOffsetInChapter = offset
-        val cpp = getCharsPerPage()
-        if (cpp > 0) {
-            currentPage = offset / cpp
-            totalPages = ceil(currentChapterText.length.toDouble() / cpp).toInt()
-            if (totalPages < 1) totalPages = 1
-            if (currentPage >= totalPages) currentPage = totalPages - 1
-        } else {
-            currentPage = 0
-            totalPages = 1
-        }
+        // 按真实排版重新分页，并由持久化的字符偏移定位到正确页码
+        repaginate(alignPageToOffset = true)
         readerService?.setChapter(currentChapterText)
         readerService?.seekToOffset(currentOffsetInChapter)
         if (isPlaying) readerService?.resume()
@@ -1529,37 +1594,29 @@ class MainActivity : AppCompatActivity(), TtsBookApplication.CountdownListener {
         }
     }
 
-    private fun highlightCurrentLine(charOffset: Int) {
-        if (lineStartOffsets.isEmpty()) return
-        val cpp = getCharsPerPage()
-        val pageStart = currentPage * cpp
-        val pageEnd = min(pageStart + cpp, currentChapterText.length)
-        if (charOffset < pageStart || charOffset >= pageEnd) return
-        for (i in lineStartOffsets.indices) {
-            if (charOffset >= lineStartOffsets[i] && charOffset < lineEndOffsets[i]) {
-                return
-            }
-        }
-    }
-
+    /**
+     * 读取控制面板设置。原来的「每页行数 / 每行字数 / 首尾缩字」是为固定字数
+     * 硬切服务的，这里把它们映射成测量式分页的行数上限与圆屏安全边距 ——
+     * 用户已有的设置不会失效，也不需要迁移存储格式。
+     */
     private fun loadSettings() {
-        rowsPerPage = prefs.getInt("rows_per_page", 6)
         val seqStr = prefs.getString("chars_sequence", "8,10,10,10,10,8")
-        charsSequence = seqStr?.split(",")?.mapNotNull { it.trim().toIntOrNull() } ?: listOf(8, 10, 10, 10, 10, 8)
-        if (charsSequence.isEmpty()) charsSequence = listOf(8, 10, 10, 10, 10, 8)
-        fontSize = prefs.getFloat("font_size", 18f)
+        val seq = seqStr?.split(",")
+            ?.mapNotNull { it.trim().toIntOrNull()?.coerceAtLeast(1) }
+            ?.takeIf { it.isNotEmpty() }
+            ?: listOf(8, 10, 10, 10, 10, 8)
+
+        maxLinesPerPage = prefs.getInt("rows_per_page", 6).coerceIn(1, 12)
+        val base = (seq.maxOrNull() ?: 10).coerceAtLeast(1)
+        val trim = (base - (seq.firstOrNull() ?: base)).coerceAtLeast(0)
+        // 每行字数越大 → 水平边距越小；首尾缩字越多 → 圆屏上下留白越大
+        horizontalPaddingDp = (20f * 10f / base.toFloat()).coerceIn(6f, 36f)
+        verticalPaddingDp = (24f + trim * 2f).coerceIn(12f, 48f)
+        fontSize = prefs.getFloat("font_size", 18f).coerceIn(10f, 30f)
     }
 
     private fun applyNewSettings() {
-        if (currentChapterText.isNotEmpty()) {
-            val cpp = getCharsPerPage()
-            totalPages = if (cpp > 0) ceil(currentChapterText.length.toDouble() / cpp).toInt() else 1
-        }
-    }
-
-    private fun getCharsPerPage(): Int {
-        val total = charsSequence.take(rowsPerPage).sum()
-        return if (total > 0) total else 100
+        if (currentChapterText.isNotEmpty()) repaginate()
     }
 
     /**
